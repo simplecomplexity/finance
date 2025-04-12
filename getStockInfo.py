@@ -1,211 +1,156 @@
-import numpy as np
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+TSE 上場銘柄（証券コード）の配当・株価・EPS・BPS を yfinance から取得するスクリプト
+--------------------------------------------------------------------
+使い方例：
+# トヨタ(7203) と ソニー(6758) の株価と EPS を取得
+python getStockInfo.py 7203 6758 --price --eps
+
+# 5016(新日石) の配当履歴だけ取得
+python getStockInfo.py 5016 --div
+
+# 3 銘柄の株価・EPS・BPS を取得し CSV 出力
+python getStockInfo.py 7203 6758 5016 --price --eps --bps --csv result.csv
+python getStockInfo.py 7203 6758 5016 --price --eps --csv result.csv
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from typing import Any
+
 import pandas as pd
 import yfinance as yf
 
-"""
-東京証券取引所の証券コード、社名一覧はGoogleで「上場会社一覧　日本取引所グループ JPX」と検索し、
-検索結果の中から日本取引所グループ　東証上場銘柄一覧　のxlsファイルを取得する
-"""
 
-"""
-PER: 株価収益率　株価が1株あたりの当期純利益(EPS)に対してどのくらい買われているか
-EPS: 1株あたりの純利益　企業の収益力を示す指標
-PBR: 株価純資産倍率　株価が1株あたりの純資産(BPS)に対してどのくらい買われているか
-BPS: 1株あたりの純資産　企業の資産力を示す指標
+# ------------------------------------------------------------------
+# 低レベル API ------------------------------------------------------
+# ------------------------------------------------------------------
+def _yf_ticker(code: str) -> yf.Ticker:
+    """証券コード -> yfinance ティッカー"""
+    return yf.Ticker(f"{code}.T")
 
-PER = 株価/EPS
-PBR = 株価/BPS
-"""
 
-def get_tse_dividend_info(ticker_code: str):
-    """
-    引数のticker_codeは証券コード（例: '7203'など）を想定。
-    TSE上場銘柄の配当金データをDataFrameで返す。
-    取得できない場合は空のDataFrameやエラーとなる可能性あり。
-    """
-    # yfinanceでは、TSE銘柄の場合「<証券コード>.T」をティッカーとして指定
-    yf_ticker = f"{ticker_code}.T"
+def _latest_close(code: str) -> float | None:
+    """直近終値（株価）"""
+    hist = _yf_ticker(code).history(period="1d", interval="1d")
+    return None if hist.empty else float(hist["Close"].iloc[-1])
 
-    # Tickerオブジェクトを作成
-    ticker = yf.Ticker(yf_ticker)
 
-    # dividends属性で配当履歴を取得 (pandas Series形式)
-    dividends_series = ticker.dividends
-    
-    # Series -> DataFrameに変換し、列名を付けてみる
-    df_dividends = dividends_series.to_frame(name="Dividend")
-    df_dividends.reset_index(inplace=True)  # 日付を列にする
-    df_dividends.rename(columns={"Date": "PayDate"}, inplace=True)
-    
-    return df_dividends
+def _eps(code: str) -> float | None:
+    """EPS"""
+    info = _yf_ticker(code).info
+    for k in ("trailingEps", "epsTrailingTwelveMonths", "forwardEps"):
+        if (v := info.get(k)) is not None:
+            return float(v)
+    return None
 
-def get_tse_stock_price(ticker_code: str):
-    """
-    東京証券取引所(TSE)上場銘柄の現在(または直近)株価を取得する関数。
-    引数のticker_codeは例: "7203" (トヨタ) のような数字のみを想定。
-    yfinanceでは、TSE銘柄は "<コード>.T" と指定する。
-    
-    返り値:
-      最新の終値 (float) を返す。
-      取得できない場合は None を返す。
-    """
-    # yfinance用に「<コード>.T」という形式を作る
-    yf_ticker = f"{ticker_code}.T"
 
-    # yfinance で Tickerオブジェクトを生成
-    ticker = yf.Ticker(yf_ticker)
+def _bps(code: str) -> float | None:
+    """BPS"""
+    info = _yf_ticker(code).info
+    for k in ("bookValuePerShare", "bookValue"):
+        if (v := info.get(k)) is not None:
+            return float(v)
+    return None
 
-    # 履歴情報 (ヒストリカルデータ) を取得
-    # period='1d' は「直近1日分」のデータを要求
-    # interval='1d' は日足
-    data = ticker.history(period='1d', interval='1d')
-    
-    if data.empty:
-        return None
-    
-    # 最終行の "Close" カラムを取得
-    latest_close = data["Close"].iloc[-1]
-    return latest_close
 
-def get_tse_stock_eps(ticker_code: str):
-    """
-    東京証券取引所(TSE)銘柄のEPSを yfinance で取得を試みる関数。
-    引数の ticker_code には、例: '7203' などの数字を指定。
-    実際には yfinance では '7203.T' のように .T を付ける必要がある。
+def _dividends(code: str) -> pd.DataFrame:
+    """配当履歴（DataFrame, 空なら取得不可）"""
+    ser = _yf_ticker(code).dividends
+    if ser.empty:
+        return pd.DataFrame()
+    df = ser.to_frame("Dividend").reset_index().rename(columns={"Date": "PayDate"})
+    return df
 
-    取得可能なら float を返す。取得できなければ None を返す。
-    """
-    # yfinance用に「<コード>.T」という形式を作る
-    yf_ticker = f"{ticker_code}.T"
 
-    # yfinance で Tickerオブジェクトを生成
-    ticker = yf.Ticker(yf_ticker)
-    
-    # yfinanceでは ticker.info['trailingEps'] や 'trailingEps' というキーで
-    # EPSが取得できる場合がある。ただし必ずしも存在するとは限らない。
-    info_dict = ticker.info  # dict
-    
-    # いくつかのキーが存在するケース: 'trailingEps', 'epsTrailingTwelveMonths', など
-    possible_keys = ['trailingEps', 'epsTrailingTwelveMonths', 'forwardEps']
-    eps_value = None
-    
-    for key in possible_keys:
-        if key in info_dict:
-            eps_value = info_dict[key]
-            if eps_value is not None:
-                break  # 最初に見つかったキーを使う
+# ------------------------------------------------------------------
+# 高レベル API ------------------------------------------------------
+# ------------------------------------------------------------------
+def fetch(
+    code: str,
+    want_price: bool = False,
+    want_eps: bool = False,
+    want_bps: bool = False,
+    want_div: bool = False,
+) -> dict[str, Any]:
+    """指定コードについて要求された項目を取得し dict で返す"""
+    result: dict[str, Any] = {"Code": code}
 
-    return eps_value
+    if want_price:
+        result["Price"] = _latest_close(code)
 
-def get_tse_stock_bps(ticker_code: str):
-    """
-    東京証券取引所(TSE)上場の銘柄について、BPS(1株あたり純資産)を
-    yfinanceから取得する試みを行う関数。
-    
-    引数:
-        ticker_code (str): 例 "7203" のような証券コード
-    
-    返り値:
-        float | None: 取得したBPS。取得できなければ None。
-    """
-    # yfinance で日本株は "<コード>.T" と表記
-    yf_ticker = f"{ticker_code}.T"
+    if want_eps:
+        result["EPS"] = _eps(code)
 
-    # yfinance で Tickerオブジェクトを生成
-    ticker = yf.Ticker(yf_ticker)
+    if want_bps:
+        result["BPS"] = _bps(code)
 
-    # dict形式で銘柄情報を取得
-    info_dict = ticker.info
-    
-    # yfinance上でBPSに相当するキーは "bookValue" や "bookValuePerShare" などがある場合がある
-    # ただし存在しないことも多い
-    possible_keys = ["bookValue", "bookValuePerShare"]
-    
-    bps_value = None
-    for key in possible_keys:
-        if key in info_dict:
-            bps_value = info_dict[key]
-            if bps_value is not None:
-                break  # 最初に見つかった値を使用
-    
-    return bps_value
+    if want_div:
+        # 配当は DataFrame をそのまま格納
+        result["Dividends"] = _dividends(code)
 
-def get_ticker(ticker):
-    print(ticker)
-    # 履歴情報 (ヒストリカルデータ) を取得
-    # period='1d' は「直近1日分」のデータを要求
-    # interval='1d' は日足
-    data = ticker.history(period='1d', interval='1d')
-    
-    if data.empty:
-        return None
-    
-    # 最終行の "Close" カラムを取得
-    latest_close = data["Close"].iloc[-1]
-    return latest_close
+    return result
 
-def selecter(ticker_code:str, dividend:bool, stock_price:bool, eps:bool, bps:bool ):
-    #print('ticker = ' + ticker_code)
-    # yfinance で日本株は "<コード>.T" と表記
-    yf_ticker = f'{ticker_code}.T'
-    # yfinance で Tickerオブジェクトを生成
-    ticker = yf.Ticker(yf_ticker)
-    print(type(ticker))
-    str = get_ticker(ticker)
-    return str
 
-def main():
-    # 例: トヨタ自動車(証券コード7203)の配当金データを取得
-    # 例: ソニーグループ(証券コード6758)
-    codes = ['7203', '6758', '5016']
+# ------------------------------------------------------------------
+# CLI ---------------------------------------------------------------
+# ------------------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="TSE 上場銘柄の株価・指標・配当を取得するツール"
+    )
+    p.add_argument("codes", nargs="+", help="証券コード（複数可）")
+    p.add_argument("--price", action="store_true", help="株価を取得")
+    p.add_argument("--eps", action="store_true", help="EPS を取得")
+    p.add_argument("--bps", action="store_true", help="BPS を取得")
+    p.add_argument("--div", action="store_true", help="配当履歴を取得")
+    p.add_argument(
+        "--csv", metavar="FILE", help="結果を CSV 保存（配当履歴は含めません）"
+    )
+    return p
 
-    flg_dividend = False
-    flg_stock_price = False
-    flg_eps = False
-    flg_bps = False
 
-    ## 配当履歴
-    if flg_dividend == True:
-        for i in range(len(codes)):
-            dividend_df = get_tse_dividend_info(codes[i])
+def main() -> None:
+    args = build_parser().parse_args()
 
-            if not dividend_df.empty:
-                print(f' [{codes[i]} の配当履歴]')
-                print(dividend_df)
-            else:
-                print(f'¥n 配当データが取得できませんでした: {codes[i]}')
-    
-    ## 株価
-    if flg_stock_price == True:
-        for i in range(len(codes)):
-            price = get_tse_stock_price(codes[i])
+    if not (args.price or args.eps or args.bps or args.div):
+        raise SystemExit("少なくとも 1 つの取得オプションを指定してください")
 
-            if price is not None:
-                print(f'証券コード{codes[i]}の直近株価: {price:.2f}')
-            else:
-                print(f'株価を取得できませんでした (code={codes[i]})')
+    rows: list[dict[str, Any]] = []
 
-    ## EPS 一株あたりの純利益
-    if flg_eps == True:
-        for i in range(len(codes)):
-            eps = get_tse_stock_eps(codes[i])
+    for code in args.codes:
+        data = fetch(
+            code,
+            want_price=args.price,
+            want_eps=args.eps,
+            want_bps=args.bps,
+            want_div=args.div,
+        )
 
-            if eps is not None:
-                print(f'証券コード {codes[i]} のEPS: {eps}')
-            else:
-                print(f'証券コード {codes[i]} のEPSが取得できませんでした。')
+        # --- 表示 ---
+        print(f"\n=== {code} ===")
+        for k, v in data.items():
+            if k == "Dividends":
+                if args.div:
+                    print("  Dividends:")
+                    print(v if not v.empty else "    <no data>")
+            elif k != "Code":
+                print(f"  {k}: {v}")
 
-    ## BPS 一株あたりの純資産
-    if flg_bps == True:
-        for i in range(len(codes)):
-            bps = get_tse_stock_bps(codes[i])
+        # CSV 用（Dividends は列挙しない）
+        rows.append({k: v for k, v in data.items() if k != "Dividends"})
 
-            if bps is not None:
-                print(f'証券コード {codes[i]} のBPS: {bps}')
-            else:
-                print(f'証券コード {codes[i]} のBPSが取得できませんでした。')
+    # --- CSV 出力 ---
+    if args.csv:
+        df_out = pd.DataFrame(rows)
+        path = Path(args.csv).expanduser()
+        df_out.to_csv(path, index=False, encoding="utf-8")
+        print(f"\n→ CSV 保存: {path}")
 
-    print(selecter(codes[0], flg_dividend, flg_stock_price, flg_eps, flg_bps))
 
 if __name__ == "__main__":
     main()
