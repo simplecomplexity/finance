@@ -8,20 +8,25 @@ TSE 上場銘柄（証券コード）の配当・株価・EPS・BPS を yfinance
 --------------------------------------------------------------------
 使い方例：
 # トヨタ(7203) と ソニー(6758) の株価と EPS を取得
-python getStockInfo.py 7203 6758 --price --eps
+python getStockInfo.py 7203 6758 --price --eps --market TSE
 
 # 5016(新日石) の配当履歴だけ取得
-python getStockInfo.py 5016 --div
+python getStockInfo.py 5016 --div --market TSE
 
 # 3 銘柄の株価・EPS・BPS を取得し CSV 出力
-python getStockInfo.py 7203 6758 5016 --price --eps --bps --csv result.csv
-python getStockInfo.py 7203 6758 5016 --price --eps --csv result.csv
+python getStockInfo.py 7203 6758 5016 --market TSE --price --eps --bps --csv result.csv
 
 # ファイル codes.txt に列挙したコードで配当を取得
-python getStockInfo.py --file codes.txt --div
+python getStockInfo.py --file codes.txt --div --market TSE
 
 # 直接指定＋ファイル指定を混在させ CSV 出力
-python getStockInfo.py 7203 --file codes.txt --price --eps --csv result.csv
+python getStockInfo.py --market TSE 7203 --file codes.txt --price --eps --csv result.csv
+
+# ニューヨーク市場
+python getStockInfo.py AAPL MSFT --market US --price --eps --csv result.csv
+
+# 日米両市場を同時に取得する場合
+python getStockInfo.py --file codes.txt --price --market US
 """
 
 from __future__ import annotations
@@ -36,36 +41,75 @@ import yfinance as yf
 # ------------------------------------------------------------------
 # 低レベル API
 # ------------------------------------------------------------------
-def _yf_ticker(code: str) -> yf.Ticker:
-    return yf.Ticker(f"{code}.T")
+def _infer_market(code: str) -> str:
+    """数字のみなら 'TSE'、それ以外は 'US' とみなす"""
+    return "TSE" if code.isdigit() else "US"
 
 
-def _latest_close(code: str) -> float | None:
-    hist = _yf_ticker(code).history(period="1d", interval="1d")
-    return None if hist.empty else float(hist["Close"].iloc[-1])
+def _yf_ticker(code: str, market: str = "TSE") -> yf.Ticker:
+    """
+    Returns a yfinance Ticker object for the given stock code and market.
+    - TSE (Tokyo Stock Exchange): Appends '.T' to the code.
+    - US (U.S. markets): Uses the code as-is.
+    """
+    mkt = market or _infer_market(code)
+
+    if mkt == "TSE":
+        return yf.Ticker(f"{code}.T")
+    elif mkt == "US":
+        return yf.Ticker(code)
+    else:
+        raise ValueError(f"Unsupported market: {mkt}")
 
 
-def _eps(code: str) -> float | None:
-    info = _yf_ticker(code).info
-    for k in ("trailingEps", "epsTrailingTwelveMonths", "forwardEps"):
-        if (v := info.get(k)) is not None:
-            return float(v)
-    return None
+def _latest_close(code: str, market: str = "TSE") -> float | None:
+    try:
+        hist = _yf_ticker(code, market).history(period="1d", interval="1d")
+        if hist.empty:
+            print(f"Warning: No price data found for {code} in market {market}")
+            return None
+        return float(hist["Close"].iloc[-1])
+    except Exception as e:
+        print(f"Error fetching latest close for {code} in market {market}: {e}")
+        return None
 
 
-def _bps(code: str) -> float | None:
-    info = _yf_ticker(code).info
-    for k in ("bookValuePerShare", "bookValue"):
-        if (v := info.get(k)) is not None:
-            return float(v)
-    return None
+def _eps(code: str, market: str = "TSE") -> float | None:
+    try:
+        info = _yf_ticker(code, market).info
+        for k in ("trailingEps", "epsTrailingTwelveMonths", "forwardEps"):
+            if (v := info.get(k)) is not None:
+                return float(v)
+        print(f"Warning: No EPS data found for {code} in market {market}")
+        return None
+    except Exception as e:
+        print(f"Error fetching EPS for {code} in market {market}: {e}")
+        return None
 
 
-def _dividends(code: str) -> pd.DataFrame:
-    ser = _yf_ticker(code).dividends
-    if ser.empty:
+def _bps(code: str, market: str = "TSE") -> float | None:
+    try:
+        info = _yf_ticker(code, market).info
+        for k in ("bookValuePerShare", "bookValue"):
+            if (v := info.get(k)) is not None:
+                return float(v)
+        print(f"Warning: No BPS data found for {code} in market {market}")
+        return None
+    except Exception as e:
+        print(f"Error fetching BPS for {code} in market {market}: {e}")
+        return None
+
+
+def _dividends(code: str, market: str = "TSE") -> pd.DataFrame:
+    try:
+        ser = _yf_ticker(code, market).dividends
+        if ser.empty:
+            print(f"Warning: No dividend data found for {code} in market {market}")
+            return pd.DataFrame()
+        return ser.to_frame("Dividend").reset_index().rename(columns={"Date": "PayDate"})
+    except Exception as e:
+        print(f"Error fetching dividends for {code} in market {market}: {e}")
         return pd.DataFrame()
-    return ser.to_frame("Dividend").reset_index().rename(columns={"Date": "PayDate"})
 
 
 # ------------------------------------------------------------------
@@ -73,20 +117,23 @@ def _dividends(code: str) -> pd.DataFrame:
 # ------------------------------------------------------------------
 def fetch(
     code: str,
+    market: str | None = None,  # Noneを許容
     want_price: bool = False,
     want_eps: bool = False,
     want_bps: bool = False,
     want_div: bool = False,
 ) -> dict[str, Any]:
-    res: dict[str, Any] = {"Code": code}
+    mkt = market or _infer_market(code) # 自動判定
+    res: dict[str, Any] = {"Code": code, "Market": mkt}
+
     if want_price:
-        res["Price"] = _latest_close(code)
+        res["Price"] = _latest_close(code, mkt)
     if want_eps:
-        res["EPS"] = _eps(code)
+        res["EPS"] = _eps(code, mkt)
     if want_bps:
-        res["BPS"] = _bps(code)
+        res["BPS"] = _bps(code, mkt)
     if want_div:
-        res["Dividends"] = _dividends(code)
+        res["Dividends"] = _dividends(code, mkt)
     return res
 
 
@@ -104,9 +151,10 @@ def _read_code_file(path: str | Path) -> list[str]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="TSE 上場銘柄情報取得ツール")
+    p = argparse.ArgumentParser(description="TSE/US 上場銘柄情報取得ツール")
     p.add_argument("codes", nargs="*", help="証券コード（スペース区切りで複数可）")
     p.add_argument("--file", metavar="PATH", help="証券コードを列挙したテキストファイル")
+    p.add_argument("--market", choices=["TSE", "US"], help="市場を強制指定 (未指定ならコードから自動判定)")
     p.add_argument("--price", action="store_true", help="株価を取得")
     p.add_argument("--eps", action="store_true", help="EPS を取得")
     p.add_argument("--bps", action="store_true", help="BPS を取得")
@@ -142,6 +190,7 @@ def main() -> None:
     for code in codes:
         data = fetch(
             code,
+            market=args.market, # Noneを許容
             want_price=args.price,
             want_eps=args.eps,
             want_bps=args.bps,
@@ -149,13 +198,13 @@ def main() -> None:
         )
 
         # 表示
-        print(f"\n=== {code} ===")
+        print(f"\n=== {code} ({args.market}) ===")
         for k, v in data.items():
             if k == "Dividends":
                 if args.div:
                     print("  Dividends:")
                     print(v if not v.empty else "    <no data>")
-            elif k != "Code":
+            elif k not in ("Code", "Market"):
                 print(f"  {k}: {v}")
 
         # CSV 用
