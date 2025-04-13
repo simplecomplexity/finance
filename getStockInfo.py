@@ -152,6 +152,7 @@ def fetch(
     want_bps: bool = False,
     want_div: bool = False,
     want_div_yield: bool = False,  # 利回りを計算するかどうか
+    exclude_dividends: bool = False,  # Optionally exclude "Dividends"
 ) -> dict[str, Any]:
     """
     指定した証券コードの株価・EPS・BPS・配当履歴・利回りを取得する
@@ -166,7 +167,7 @@ def fetch(
             res["EPS"] = _eps(code, mkt)
         if want_bps:
             res["BPS"] = _bps(code, mkt)
-        if want_div:
+        if want_div and not exclude_dividends:
             res["Dividends"] = _dividends(code, mkt)
         if want_div_yield:
             res["Yield"] = _yield(code, mkt)
@@ -206,14 +207,20 @@ def main() -> None:
     args = build_parser().parse_args()
 
     if not (args.price or args.eps or args.bps or args.div or args.div_yield):
-        raise SystemExit("少なくとも 1 つの取得オプション (--price/--eps/--bps/--div/--div-yield) を指定してください")
+        print("少なくとも 1 つの取得オプション (--price/--eps/--bps/--div/--div-yield) を指定してください")
+        build_parser().print_help()
+        return
 
     # --- コード一覧を組み立てる ---------------------------------
-    codes: list[str] = list(dict.fromkeys(args.codes))  # 直接指定（重複除去）
-
     if args.file:
+        if not Path(args.file).expanduser().exists():
+            raise SystemExit(f"ファイル '{args.file}' が存在しません")
+        if not Path(args.file).expanduser().is_file():
+            raise SystemExit(f"'{args.file}' は有効なファイルではありません")
         codes_from_file = _read_code_file(args.file)
         if not codes_from_file:
+            raise SystemExit(f"ファイル '{args.file}' から有効なコードが読み取れませんでした")
+        codes.extend(codes_from_file)
             raise SystemExit(f"ファイル '{args.file}' から有効なコードが読み取れませんでした")
         codes.extend(codes_from_file)
 
@@ -222,20 +229,18 @@ def main() -> None:
 
     # 重複を除いてソート
     codes = sorted(set(codes))
-
-    # --- 取得ループ ---------------------------------------------
-    rows: list[dict[str, Any]] = []
-
     for code in codes:
-        # 市場を自動判別または指定された市場を使用
-        market = args.market or _infer_market(code)
-
         try:
             data = fetch(
                 code,
-                market=args.market, # Noneを許容
+                market=args.market,  # Noneを許容
                 want_price=args.price,
                 want_eps=args.eps,
+                want_bps=args.bps,
+                want_div=args.div,
+                want_div_yield=args.div_yield,
+                exclude_dividends=bool(args.csv),
+            )
                 want_bps=args.bps,
                 want_div=args.div,
                 want_div_yield=args.div_yield,
@@ -245,22 +250,26 @@ def main() -> None:
             print(f"\n=== {code} ({args.market}) ===")
             for k, v in data.items():
                 if k == "Dividends":
-                    if args.div:
+            print(f"\n=== {code} ({market}) ===")
                         print("  Dividends:")
                         print(v if not v.empty else "    <no data>")
                 elif k not in ("Code", "Market"):
                     print(f"  {k}: {v}")
 
             # CSV 用
-            rows.append({k: v for k, v in data.items() if k != "Dividends"})
+            if args.csv:
+                rows.append({k: v for k, v in data.items() if k != "Dividends"})
         except Exception as e:
             print(f"Error processing {code} in market {market}: {e}")
             continue
-    # --- CSV 出力 -----------------------------------------------
+    # --- CSV 保存 ---
     if args.csv:
         df_out = pd.DataFrame(rows)
-        Path(args.csv).expanduser().write_text(df_out.to_csv(index=False, encoding="utf-8"))
-        print(f"\n→ CSV 保存: {args.csv}")
+        try:
+            Path(args.csv).expanduser().write_text(df_out.to_csv(index=False, encoding="utf-8"))
+            print(f"\n→ CSV 保存: {args.csv}")
+        except Exception as e:
+            print(f"Error saving CSV to '{args.csv}': {e}")
 
 
 if __name__ == "__main__":
