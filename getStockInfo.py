@@ -112,6 +112,35 @@ def _dividends(code: str, market: str = "TSE") -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _yield(code: str, market: str = "TSE") -> float | None:
+    """
+    過去1年分の配当金と最新株価から利回りを計算する
+    """
+    try:
+        # 過去1年分の配当金を取得
+        dividends = _dividends(code, market)
+        if dividends.empty:
+            print(f"Warning: No dividend data found for {code} in market {market}")
+            return None
+
+        # 過去1年分の配当金の合計
+        one_year_ago = pd.Timestamp.now(tz=dividends["PayDate"].dt.tz) - pd.Timedelta(days=365)
+        recent_dividends = dividends[dividends["PayDate"] >= one_year_ago]
+        total_dividends = recent_dividends["Dividend"].sum()
+
+        # 最新株価を取得
+        latest_price = _latest_close(code, market)
+        if latest_price is None or latest_price == 0:
+            print(f"Warning: Cannot calculate yield for {code} due to missing price data")
+            return None
+
+        # 利回りを計算し、小数点以下2桁にフォーマット
+        yield_value = (total_dividends / latest_price) * 100
+        return round(yield_value, 2)
+    except Exception as e:
+        print(f"Error calculating yield for {code} in market {market}: {e}")
+        return None
+
 # ------------------------------------------------------------------
 # 高レベル API
 # ------------------------------------------------------------------
@@ -122,18 +151,27 @@ def fetch(
     want_eps: bool = False,
     want_bps: bool = False,
     want_div: bool = False,
+    want_div_yield: bool = False,  # 利回りを計算するかどうか
 ) -> dict[str, Any]:
+    """
+    指定した証券コードの株価・EPS・BPS・配当履歴・利回りを取得する
+    """
     mkt = market or _infer_market(code) # 自動判定
     res: dict[str, Any] = {"Code": code, "Market": mkt}
 
-    if want_price:
-        res["Price"] = _latest_close(code, mkt)
-    if want_eps:
-        res["EPS"] = _eps(code, mkt)
-    if want_bps:
-        res["BPS"] = _bps(code, mkt)
-    if want_div:
-        res["Dividends"] = _dividends(code, mkt)
+    try:
+        if want_price:
+            res["Price"] = _latest_close(code, mkt)
+        if want_eps:
+            res["EPS"] = _eps(code, mkt)
+        if want_bps:
+            res["BPS"] = _bps(code, mkt)
+        if want_div:
+            res["Dividends"] = _dividends(code, mkt)
+        if want_div_yield:
+            res["Yield"] = _yield(code, mkt)
+    except Exception as e:
+        print(f"Error fetching data for {code} in market {mkt}: {e}")
     return res
 
 
@@ -159,6 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--eps", action="store_true", help="EPS を取得")
     p.add_argument("--bps", action="store_true", help="BPS を取得")
     p.add_argument("--div", action="store_true", help="配当履歴を取得")
+    p.add_argument("--div-yield", action="store_true", help="利回りを計算")
     p.add_argument("--csv", metavar="FILE", help="結果を CSV 保存（配当履歴は含まず）")
     return p
 
@@ -166,8 +205,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
 
-    if not (args.price or args.eps or args.bps or args.div):
-        raise SystemExit("少なくとも 1 つの取得オプション (--price/--eps/--bps/--div) を指定してください")
+    if not (args.price or args.eps or args.bps or args.div or args.div_yield):
+        raise SystemExit("少なくとも 1 つの取得オプション (--price/--eps/--bps/--div/--div-yield) を指定してください")
 
     # --- コード一覧を組み立てる ---------------------------------
     codes: list[str] = list(dict.fromkeys(args.codes))  # 直接指定（重複除去）
@@ -188,28 +227,35 @@ def main() -> None:
     rows: list[dict[str, Any]] = []
 
     for code in codes:
-        data = fetch(
-            code,
-            market=args.market, # Noneを許容
-            want_price=args.price,
-            want_eps=args.eps,
-            want_bps=args.bps,
-            want_div=args.div,
-        )
+        # 市場を自動判別または指定された市場を使用
+        market = args.market or _infer_market(code)
 
-        # 表示
-        print(f"\n=== {code} ({args.market}) ===")
-        for k, v in data.items():
-            if k == "Dividends":
-                if args.div:
-                    print("  Dividends:")
-                    print(v if not v.empty else "    <no data>")
-            elif k not in ("Code", "Market"):
-                print(f"  {k}: {v}")
+        try:
+            data = fetch(
+                code,
+                market=args.market, # Noneを許容
+                want_price=args.price,
+                want_eps=args.eps,
+                want_bps=args.bps,
+                want_div=args.div,
+                want_div_yield=args.div_yield,
+            )
 
-        # CSV 用
-        rows.append({k: v for k, v in data.items() if k != "Dividends"})
+            # 表示
+            print(f"\n=== {code} ({args.market}) ===")
+            for k, v in data.items():
+                if k == "Dividends":
+                    if args.div:
+                        print("  Dividends:")
+                        print(v if not v.empty else "    <no data>")
+                elif k not in ("Code", "Market"):
+                    print(f"  {k}: {v}")
 
+            # CSV 用
+            rows.append({k: v for k, v in data.items() if k != "Dividends"})
+        except Exception as e:
+            print(f"Error processing {code} in market {market}: {e}")
+            continue
     # --- CSV 出力 -----------------------------------------------
     if args.csv:
         df_out = pd.DataFrame(rows)
